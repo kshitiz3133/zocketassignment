@@ -9,8 +9,10 @@ import (
 
 	"context"
 	"log"
+	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 	"github.com/streadway/amqp"
 )
 
@@ -18,9 +20,18 @@ var dbPool *pgxpool.Pool
 
 func initDB() {
 	// Replace these values with your Render database connection details
-	dsn := "postgresql://root:P6n7WFCZUvANvYNgaTxOR3bWDJOheCU4@dpg-cta3oht6l47c73bhfv5g-a.oregon-postgres.render.com/zocketdb"
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatalf("Error loading .env file: %v\n", err)
+	}
 
-	var err error
+	// Retrieve PostgreSQL connection URL
+	dsn := os.Getenv("POSTGRES_URL")
+	if dsn == "" {
+		log.Fatalf("POSTGRES_URL is not set in the environment")
+	}
+
+	// Connect to PostgreSQL
 	dbPool, err = pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
