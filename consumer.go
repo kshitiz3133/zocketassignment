@@ -178,18 +178,49 @@ func processImage(imageURL string, productID int) error {
 	linkArg := &sharing.CreateSharedLinkWithSettingsArg{
 		Path: path,
 	}
-	linkMetadata, err := sharingClient.CreateSharedLinkWithSettings(linkArg)
-	if err != nil {
-		return fmt.Errorf("failed to create sharable link: %v", err)
-	}
 
-	// Extract the sharable URL
+	// Try to create a shared link
+	linkMetadata, err := sharingClient.CreateSharedLinkWithSettings(linkArg)
+
 	var shareableURL string
-	if link, ok := linkMetadata.(*sharing.FileLinkMetadata); ok {
-		shareableURL = link.Url
-		fmt.Println("Sharable link:", shareableURL)
+	if err != nil {
+		// Check if the error indicates that the shared link already exists
+		if dropboxError, ok := err.(dropbox.APIError); ok {
+			fmt.Println("Error Summary:", dropboxError.ErrorSummary) // Debugging the error
+			if dropboxError.ErrorSummary == "shared_link_already_exists/metadata/" {
+				// If the link already exists, retrieve the existing metadata
+				fmt.Println("Shared link already exists, retrieving metadata...")
+				// Call GetSharedLinkMetadata to retrieve the existing shared link
+				existingLink, err := sharingClient.GetSharedLinkMetadata(&sharing.GetSharedLinkMetadataArg{
+					Url: "https://www.dropbox.com" + path, // Full URL with the Dropbox domain
+				})
+				if err != nil {
+					return fmt.Errorf("failed to retrieve existing shared link: %v", err)
+				}
+
+				// Assert the existing link to the correct type (FileLinkMetadata)
+				if fileLinkMetadata, ok := existingLink.(*sharing.FileLinkMetadata); ok {
+					shareableURL = fileLinkMetadata.Url
+					fmt.Println("Shared link already exists:", shareableURL)
+				} else {
+					return fmt.Errorf("unexpected metadata type for shared link")
+				}
+			} else {
+				// If the error is not related to the link already existing, return the error
+				return fmt.Errorf("failed to create sharable link: %v", err)
+			}
+		} else {
+			// If the error is not an APIError, return the error
+			return fmt.Errorf("failed to create sharable link: %v", err)
+		}
 	} else {
-		return fmt.Errorf("unexpected metadata type")
+		// Extract the sharable URL from the metadata
+		if link, ok := linkMetadata.(*sharing.FileLinkMetadata); ok {
+			shareableURL = link.Url
+			fmt.Println("Sharable link:", shareableURL)
+		} else {
+			return fmt.Errorf("unexpected metadata type")
+		}
 	}
 
 	// Update the product in the database with the new compressed image URL
