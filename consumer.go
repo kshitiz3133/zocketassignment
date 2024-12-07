@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/jpeg"
 	_ "image/png"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -17,12 +20,14 @@ import (
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/sharing"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/nfnt/resize"
 	"github.com/streadway/amqp"
 )
 
 var dropboxConfig dropbox.Config
+var dbPool *pgxpool.Pool
 
 func init() {
 
@@ -59,9 +64,32 @@ func init() {
 	if err != nil {
 		panic("Failed to declare a queue: " + err.Error())
 	}
-
+	initDB()
 	// Start consuming
 	go consumeImages(ch)
+}
+
+func initDB() {
+	// Replace these values with your Render database connection details
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatalf("Error loading .env file: %v\n", err)
+	}
+
+	// Retrieve PostgreSQL connection URL
+	dsn := os.Getenv("POSTGRES_URL")
+	if dsn == "" {
+		log.Fatalf("POSTGRES_URL is not set in the environment")
+	}
+
+	// Connect to PostgreSQL
+	dbPool, err = pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		log.Fatalf("Unable to connect to database: %v\n", err)
+	}
+
+	log.Println("Connected to PostgreSQL database successfully!")
+	//initSchema()
 }
 
 func consumeImages(ch *amqp.Channel) {
@@ -79,19 +107,30 @@ func consumeImages(ch *amqp.Channel) {
 	}
 
 	for msg := range msgs {
-		imageURL := string(msg.Body)
-		fmt.Println("Processing image:", imageURL)
+		var message struct {
+			ProductID int    `json:"product_id"`
+			ImageURL  string `json:"image_url"`
+		}
 
-		err := processImage(imageURL)
+		// Unmarshal the JSON message to get product ID and image URL
+		err := json.Unmarshal(msg.Body, &message)
+		if err != nil {
+			fmt.Println("Failed to unmarshal message:", err)
+			continue
+		}
+
+		fmt.Printf("Processing product ID: %d with image URL: %s\n", message.ProductID, message.ImageURL)
+
+		// Process the image using the image URL
+		err = processImage(message.ImageURL, message.ProductID)
 		if err != nil {
 			fmt.Println("Failed to process image:", err)
 		} else {
-			fmt.Println("Image processed and saved successfully:", imageURL)
+			fmt.Println("Image processed and saved successfully:", message.ImageURL)
 		}
 	}
 }
-
-func processImage(imageURL string) error {
+func processImage(imageURL string, productID int) error {
 	// Fetch the image from the URL
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(imageURL)
@@ -100,7 +139,7 @@ func processImage(imageURL string) error {
 	}
 	defer resp.Body.Close()
 
-	// Decode the image
+	// Decode the image (supports various formats like PNG, JPEG, GIF)
 	img, _, err := image.Decode(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to decode image: %v", err)
@@ -145,10 +184,28 @@ func processImage(imageURL string) error {
 	}
 
 	// Extract the sharable URL
+	var shareableURL string
 	if link, ok := linkMetadata.(*sharing.FileLinkMetadata); ok {
-		fmt.Println("Sharable link:", link.Url)
+		shareableURL = link.Url
+		fmt.Println("Sharable link:", shareableURL)
 	} else {
 		return fmt.Errorf("unexpected metadata type")
+	}
+
+	// Update the product in the database with the new compressed image URL
+	if dbPool == nil {
+		return fmt.Errorf("database connection is not initialized")
+	}
+
+	// Proceed with the database query
+	query := `
+		UPDATE products 
+		SET compressed_product_images = array_append(coalesce(compressed_product_images, '{}'::text[]), $1)
+		WHERE id = $2;
+	`
+	_, err = dbPool.Exec(context.Background(), query, shareableURL, productID)
+	if err != nil {
+		return fmt.Errorf("failed to update compressed image URL in database: %v", err)
 	}
 
 	return nil

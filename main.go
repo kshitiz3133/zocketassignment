@@ -1,15 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
-
-	"context"
-	"log"
-	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
@@ -43,14 +42,9 @@ func initDB() {
 
 // func initSchema() {
 // 	query := `
-//     CREATE TABLE IF NOT EXISTS products (
-//         id SERIAL PRIMARY KEY,
-//         user_id INT NOT NULL,
-//         product_name TEXT NOT NULL,
-//         product_description TEXT,
-//         product_images TEXT[], -- Array of image URLs
-//         product_price NUMERIC(10, 2) NOT NULL
-//     );`
+//     ALTER TABLE products
+// 	ADD COLUMN compressed_product_images TEXT[];
+// 	`
 
 // 	_, err := dbPool.Exec(context.Background(), query)
 // 	if err != nil {
@@ -61,12 +55,13 @@ func initDB() {
 
 // Product struct to define product fields
 type Product struct {
-	ID                 int      `json:"id"`
-	UserID             int      `json:"user_id"`
-	ProductName        string   `json:"product_name"`
-	ProductDescription string   `json:"product_description"`
-	ProductImages      []string `json:"product_images"`
-	ProductPrice       float64  `json:"product_price"`
+	ID                      int      `json:"id"`
+	UserID                  int      `json:"user_id"`
+	ProductName             string   `json:"product_name"`
+	ProductDescription      string   `json:"product_description"`
+	ProductImages           []string `json:"product_images"`
+	CompressedProductImages []string `json:"compressed_product_images"`
+	ProductPrice            float64  `json:"product_price"`
 }
 
 // Response structure to send JSON data
@@ -147,6 +142,7 @@ func main() {
 }
 
 // Handler to create a new product
+// Handler to create a new product
 func createProductHandler(w http.ResponseWriter, r *http.Request) {
 	var product Product
 	err := json.NewDecoder(r.Body).Decode(&product)
@@ -168,23 +164,37 @@ func createProductHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Publish each image URL to RabbitMQ
+	// Publish each image URL to RabbitMQ, along with the product ID
 	for _, imageURL := range product.ProductImages {
-		err := amqpChannel.Publish(
+		// Create a message with product ID and image URL
+		message := map[string]interface{}{
+			"product_id": product.ID,
+			"image_url":  imageURL,
+		}
+
+		// Convert the message to JSON
+		messageJSON, err := json.Marshal(message)
+		if err != nil {
+			http.Error(w, "Failed to create JSON message", http.StatusInternalServerError)
+			return
+		}
+
+		// Publish the message to RabbitMQ
+		err = amqpChannel.Publish(
 			"",            // exchange
 			"image_queue", // routing key
 			false,         // mandatory
 			false,         // immediate
 			amqp.Publishing{
-				ContentType: "text/plain",
-				Body:        []byte(imageURL),
+				ContentType: "application/json",
+				Body:        messageJSON,
 			},
 		)
 		if err != nil {
 			http.Error(w, "Failed to enqueue image URL", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("Enqueued image URL: %s", imageURL) // Log the URL that's enqueued
+		log.Printf("Enqueued product ID %d with image URL: %s", product.ID, imageURL)
 	}
 
 	// Respond with the created product
@@ -202,9 +212,9 @@ func getProductByIDHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := `SELECT id, user_id, product_name, product_description, product_images, product_price FROM products WHERE id = $1;`
+	query := `SELECT id, user_id, product_name, product_description, product_images, compressed_product_images, product_price FROM products WHERE id = $1;`
 	var product Product
-	err = dbPool.QueryRow(context.Background(), query, id).Scan(&product.ID, &product.UserID, &product.ProductName, &product.ProductDescription, &product.ProductImages, &product.ProductPrice)
+	err = dbPool.QueryRow(context.Background(), query, id).Scan(&product.ID, &product.UserID, &product.ProductName, &product.ProductDescription, &product.ProductImages, &product.CompressedProductImages, &product.ProductPrice)
 	if err != nil {
 		http.Error(w, "Product not found", http.StatusNotFound)
 		return
@@ -215,8 +225,9 @@ func getProductByIDHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Handler to get all products
+
 func getProductsHandler(w http.ResponseWriter, _ *http.Request) {
-	query := `SELECT id, user_id, product_name, product_description, product_images, product_price FROM products;`
+	query := `SELECT id, user_id, product_name, product_description, product_images, compressed_product_images, product_price FROM products;`
 
 	rows, err := dbPool.Query(context.Background(), query)
 	if err != nil {
@@ -229,12 +240,15 @@ func getProductsHandler(w http.ResponseWriter, _ *http.Request) {
 	var products []Product
 	for rows.Next() {
 		var product Product
-		err := rows.Scan(&product.ID, &product.UserID, &product.ProductName, &product.ProductDescription, &product.ProductImages, &product.ProductPrice)
+
+		err := rows.Scan(&product.ID, &product.UserID, &product.ProductName, &product.ProductDescription, &product.ProductImages, &product.CompressedProductImages, &product.ProductPrice)
 		if err != nil {
 			http.Error(w, "Failed to parse products", http.StatusInternalServerError)
 			log.Printf("Error parsing product: %v\n", err)
 			return
 		}
+
+		// Convert pq.StringArray to []string (this is automatic, but it's good to be explicit)
 		products = append(products, product)
 	}
 
