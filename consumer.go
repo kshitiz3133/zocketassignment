@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -13,11 +14,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
+	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
+	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/sharing"
+	"github.com/joho/godotenv"
 	"github.com/nfnt/resize"
 	"github.com/streadway/amqp"
 )
 
+var dropboxConfig dropbox.Config
+
 func init() {
+
+	if err := godotenv.Load(); err != nil {
+		panic("Error loading .env file")
+	}
+
+	// Set Dropbox token from env
+	dropboxConfig = dropbox.Config{
+		Token:    os.Getenv("DROPBOX_ACCESS_TOKEN"),
+		LogLevel: dropbox.LogInfo,
+	}
+
 	// Establish RabbitMQ connection
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
@@ -74,45 +92,63 @@ func consumeImages(ch *amqp.Channel) {
 }
 
 func processImage(imageURL string) error {
-	// Get the image from the URL
-	client := &http.Client{Timeout: 10 * time.Second} // Add timeout for network requests
+	// Fetch the image from the URL
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(imageURL)
 	if err != nil {
 		return fmt.Errorf("failed to fetch image: %v", err)
 	}
 	defer resp.Body.Close()
 
-	// Check if the content type is valid
-	contentType := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(contentType, "image/") {
-		return fmt.Errorf("invalid image format: %v", contentType)
-	}
-
-	// Decode the image using image.Decode (supports JPEG, PNG, GIF, BMP, etc.)
-	img, format, err := image.Decode(resp.Body)
+	// Decode the image
+	img, _, err := image.Decode(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to decode image: %v", err)
 	}
-	fmt.Printf("Decoded image format: %s\n", format)
 
-	// Resize the image to 300x300 pixels
+	// Resize the image
 	resized := resize.Resize(300, 300, img, resize.Lanczos3)
 
-	// Extract and sanitize the file name from the URL
-	fileName := sanitizeFileName(extractFileName(imageURL))
-	os.MkdirAll("compressed_images", os.ModePerm)
-
-	// Save the resized image locally as JPEG
-	out, err := os.Create("compressed_images/" + fileName)
+	// Create a temporary buffer to store the resized image
+	var buffer bytes.Buffer
+	err = jpeg.Encode(&buffer, resized, &jpeg.Options{Quality: 80})
 	if err != nil {
-		return fmt.Errorf("failed to create file: %v", err)
+		return fmt.Errorf("failed to encode image: %v", err)
 	}
-	defer out.Close()
 
-	// Compress and save as JPEG
-	err = jpeg.Encode(out, resized, &jpeg.Options{Quality: 80})
+	// Set up Dropbox client
+	dropboxClient := files.New(dropboxConfig)
+
+	// Set the path to upload to Dropbox
+	path := "/" + sanitizeFileName(extractFileName(imageURL))
+
+	// Create the UploadArg
+	uploadArg := files.NewUploadArg(path)
+	uploadArg.Mode = &files.WriteMode{Tagged: dropbox.Tagged{
+		Tag: "overwrite", // This sets the mode to overwrite
+	}}
+
+	// Upload the image to Dropbox
+	_, err = dropboxClient.Upload(uploadArg, &buffer)
 	if err != nil {
-		return fmt.Errorf("failed to compress image: %v", err)
+		return fmt.Errorf("failed to upload image to Dropbox: %v", err)
+	}
+
+	// Generate the sharable link
+	sharingClient := sharing.New(dropboxConfig)
+	linkArg := &sharing.CreateSharedLinkWithSettingsArg{
+		Path: path,
+	}
+	linkMetadata, err := sharingClient.CreateSharedLinkWithSettings(linkArg)
+	if err != nil {
+		return fmt.Errorf("failed to create sharable link: %v", err)
+	}
+
+	// Extract the sharable URL
+	if link, ok := linkMetadata.(*sharing.FileLinkMetadata); ok {
+		fmt.Println("Sharable link:", link.Url)
+	} else {
+		return fmt.Errorf("unexpected metadata type")
 	}
 
 	return nil
