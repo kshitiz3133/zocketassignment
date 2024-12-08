@@ -18,19 +18,16 @@ import (
 var dbPool *pgxpool.Pool
 
 func initDB() {
-	// Replace these values with your Render database connection details
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatalf("Error loading .env file: %v\n", err)
 	}
 
-	// Retrieve PostgreSQL connection URL
 	dsn := os.Getenv("POSTGRES_URL")
 	if dsn == "" {
 		log.Fatalf("POSTGRES_URL is not set in the environment")
 	}
 
-	// Connect to PostgreSQL
 	dbPool, err = pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		log.Fatalf("Unable to connect to database: %v\n", err)
@@ -53,7 +50,6 @@ func initDB() {
 // 	log.Println("Database schema initialized")
 // }
 
-// Product struct to define product fields
 type Product struct {
 	ID                      int      `json:"id"`
 	UserID                  int      `json:"user_id"`
@@ -64,18 +60,15 @@ type Product struct {
 	ProductPrice            float64  `json:"product_price"`
 }
 
-// Response structure to send JSON data
 type Response struct {
 	Message string `json:"message"`
 }
 
-// In-memory product storage
 var products = []Product{}
 var nextID = 1
 var amqpChannel *amqp.Channel
 
 func init() {
-	// Establish connection with RabbitMQ
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
 		panic("Failed to connect to RabbitMQ: " + err.Error())
@@ -86,14 +79,13 @@ func init() {
 		panic("Failed to open a channel: " + err.Error())
 	}
 
-	// Declare a queue
 	_, err = ch.QueueDeclare(
-		"image_queue", // name
-		true,          // durable
-		false,         // delete when unused
-		false,         // exclusive
-		false,         // no-wait
-		nil,           // arguments
+		"image_queue",
+		true,
+		false,
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
 		panic("Failed to declare a queue: " + err.Error())
@@ -103,7 +95,7 @@ func init() {
 }
 
 func main() {
-	initDB() // Initialize the database connection
+	initDB()
 	defer dbPool.Close()
 	err := dbPool.Ping(context.Background())
 	if err != nil {
@@ -111,7 +103,6 @@ func main() {
 	}
 
 	fmt.Println("Database connection is alive!")
-	// Define the /products handler
 	http.HandleFunc("/products", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			createProductHandler(w, r)
@@ -122,7 +113,6 @@ func main() {
 		}
 	})
 
-	// Define the /products/:id handler
 	http.HandleFunc("/products/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			getProductByIDHandler(w, r)
@@ -133,7 +123,6 @@ func main() {
 
 	http.HandleFunc("/cleanall", cleanAllHandler)
 
-	// Start the HTTP server
 	const addr = ":8080"
 	println("Server is running on http://localhost" + addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
@@ -141,8 +130,6 @@ func main() {
 	}
 }
 
-// Handler to create a new product
-// Handler to create a new product
 func createProductHandler(w http.ResponseWriter, r *http.Request) {
 	var product Product
 	err := json.NewDecoder(r.Body).Decode(&product)
@@ -151,7 +138,6 @@ func createProductHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Insert product into the database
 	query := `
     INSERT INTO products (user_id, product_name, product_description, product_images, product_price)
     VALUES ($1, $2, $3, $4, $5)
@@ -164,27 +150,24 @@ func createProductHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Publish each image URL to RabbitMQ, along with the product ID
+	log.Printf("Enqueued product ID %d with image URLs", product.ID)
 	for _, imageURL := range product.ProductImages {
-		// Create a message with product ID and image URL
 		message := map[string]interface{}{
 			"product_id": product.ID,
 			"image_url":  imageURL,
 		}
 
-		// Convert the message to JSON
 		messageJSON, err := json.Marshal(message)
 		if err != nil {
 			http.Error(w, "Failed to create JSON message", http.StatusInternalServerError)
 			return
 		}
 
-		// Publish the message to RabbitMQ
 		err = amqpChannel.Publish(
-			"",            // exchange
-			"image_queue", // routing key
-			false,         // mandatory
-			false,         // immediate
+			"",
+			"image_queue",
+			false,
+			false,
 			amqp.Publishing{
 				ContentType: "application/json",
 				Body:        messageJSON,
@@ -194,16 +177,13 @@ func createProductHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Failed to enqueue image URL", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("Enqueued product ID %d with image URL: %s", product.ID, imageURL)
 	}
 
-	// Respond with the created product
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(product)
 }
 
-// Handler to get a product by ID
 func getProductByIDHandler(w http.ResponseWriter, r *http.Request) {
 	idStr := strings.TrimPrefix(r.URL.Path, "/products/")
 	id, err := strconv.Atoi(idStr)
@@ -223,8 +203,6 @@ func getProductByIDHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(product)
 }
-
-// Handler to get all products
 
 func getProductsHandler(w http.ResponseWriter, _ *http.Request) {
 	query := `SELECT id, user_id, product_name, product_description, product_images, compressed_product_images, product_price FROM products;`
@@ -248,7 +226,6 @@ func getProductsHandler(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 
-		// Convert pq.StringArray to []string (this is automatic, but it's good to be explicit)
 		products = append(products, product)
 	}
 
@@ -257,13 +234,11 @@ func getProductsHandler(w http.ResponseWriter, _ *http.Request) {
 }
 
 func cleanAllHandler(w http.ResponseWriter, r *http.Request) {
-	// Only allow DELETE method for this route
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Perform the deletion query
 	query := `DELETE FROM products;`
 	_, err := dbPool.Exec(context.Background(), query)
 	if err != nil {
@@ -271,8 +246,6 @@ func cleanAllHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Error deleting products: %v\n", err)
 		return
 	}
-
-	// Send a success response
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(Response{Message: "All products deleted successfully"})

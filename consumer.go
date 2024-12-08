@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
+	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/sharing"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
@@ -129,9 +130,7 @@ func consumeImages(ch *amqp.Channel) {
 		}
 	}
 }
-
 func processImage(imageURL string, productID int) error {
-	// Fetch the image from the URL
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(imageURL)
 	if err != nil {
@@ -139,130 +138,106 @@ func processImage(imageURL string, productID int) error {
 	}
 	defer resp.Body.Close()
 
-	// Decode the image (supports various formats like PNG, JPEG, GIF)
 	img, _, err := image.Decode(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to decode image: %v", err)
 	}
 
-	// Resize the image
 	resized := resize.Resize(300, 300, img, resize.Lanczos3)
 
-	// Create a temporary buffer to store the resized image
 	var buffer bytes.Buffer
 	err = jpeg.Encode(&buffer, resized, &jpeg.Options{Quality: 80})
 	if err != nil {
 		return fmt.Errorf("failed to encode image: %v", err)
 	}
 
-	// Set the path to upload to Dropbox
+	dropboxClient := files.New(dropboxConfig)
+
 	path := "/" + sanitizeFileName(extractFileName(imageURL))
 
-	// Set up Dropbox sharing client
-	sharingClient := sharing.New(dropboxConfig)
+	uploadArg := files.NewUploadArg(path)
+	uploadArg.Mode = &files.WriteMode{Tagged: dropbox.Tagged{
+		Tag: "overwrite",
+	}}
 
-	// First, try to create a shared link
-	// First, try to create a shared link
+	_, err = dropboxClient.Upload(uploadArg, &buffer)
+	if err != nil {
+		return fmt.Errorf("failed to upload image to Dropbox: %v", err)
+	}
+
+	sharingClient := sharing.New(dropboxConfig)
 	linkArg := &sharing.CreateSharedLinkWithSettingsArg{
 		Path: path,
 	}
 
-	var shareableURL string
 	linkMetadata, err := sharingClient.CreateSharedLinkWithSettings(linkArg)
+
+	var shareableURL string
 	if err != nil {
 		if dropboxError, ok := err.(dropbox.APIError); ok {
-			// Check if the error message contains "shared_link_already_exists/metadata/"
-			if strings.Contains(dropboxError.Error(), "shared_link_already_exists/metadata/") {
-				log.Println("Shared link already exists for path:", path)
-
-				// Fetch the existing shared link
-				existingLinks, err := sharingClient.ListSharedLinks(&sharing.ListSharedLinksArg{
-					Path: path,
+			fmt.Println("Error Summary:", dropboxError.ErrorSummary) // Debugging the error
+			if dropboxError.ErrorSummary == "shared_link_already_exists/metadata/" {
+				fmt.Println("Shared link already exists, retrieving metadata...")
+				existingLink, err := sharingClient.GetSharedLinkMetadata(&sharing.GetSharedLinkMetadataArg{
+					Url: "https://www.dropbox.com" + path,
 				})
-				if err != nil || len(existingLinks.Links) == 0 {
+				if err != nil {
 					return fmt.Errorf("failed to retrieve existing shared link: %v", err)
 				}
 
-				// Extract the URL from the first link metadata
-				if fileLinkMetadata, ok := existingLinks.Links[0].(*sharing.FileLinkMetadata); ok {
+				if fileLinkMetadata, ok := existingLink.(*sharing.FileLinkMetadata); ok {
 					shareableURL = fileLinkMetadata.Url
-					log.Println("Existing shared link for path", path, ": ", shareableURL) // Print path and URL
+					fmt.Println("Shared link already exists:", shareableURL)
 				} else {
 					return fmt.Errorf("unexpected metadata type for shared link")
 				}
 			} else {
-				// Handle other types of errors that might occur
-				return fmt.Errorf("failed to create shared link: %v", err)
+				return fmt.Errorf("failed to create sharable link: %v", err)
 			}
 		} else {
-			// If it's not an APIError, log the error and proceed
-			log.Println("Error from Dropbox:", err)
-			var a string
-			a = err.Error()
-			if strings.Contains(a, "shared_link_already_exists/metadata/") {
-				existingLinks, err := sharingClient.ListSharedLinks(&sharing.ListSharedLinksArg{
-					Path: path,
-				})
-				if err != nil || len(existingLinks.Links) == 0 {
-					return fmt.Errorf("failed to retrieve existing shared link: %v", err)
-				}
-
-				// Extract the URL from the first link metadata
-				if fileLinkMetadata, ok := existingLinks.Links[0].(*sharing.FileLinkMetadata); ok {
-					shareableURL = fileLinkMetadata.Url
-					log.Println("Existing shared link for path", path, ": ", shareableURL) // Print path and URL
-				} else {
-					return fmt.Errorf("unexpected metadata type for shared link")
-				}
-			}
-			log.Println("failed to create shared link: %v", err)
+			return fmt.Errorf("failed to create sharable link: %v", err)
 		}
-
 	} else {
-		// If we successfully created the link, extract the URL
 		if link, ok := linkMetadata.(*sharing.FileLinkMetadata); ok {
 			shareableURL = link.Url
+			fmt.Println("Sharable link:", shareableURL)
 		} else {
 			return fmt.Errorf("unexpected metadata type")
 		}
 	}
 
-	// Update the product in the database with the new compressed image URL
-	query := `UPDATE products 
-        SET compressed_product_images = array_append(coalesce(compressed_product_images, '{}'::text[]), $1)
-        WHERE id = $2;`
+	if dbPool == nil {
+		return fmt.Errorf("database connection is not initialized")
+	}
+
+	query := `
+		UPDATE products 
+		SET compressed_product_images = array_append(coalesce(compressed_product_images, '{}'::text[]), $1)
+		WHERE id = $2;
+	`
 	_, err = dbPool.Exec(context.Background(), query, shareableURL, productID)
 	if err != nil {
 		return fmt.Errorf("failed to update compressed image URL in database: %v", err)
 	}
 
-	fmt.Printf("Sharable link created/retrieved: %s\n", shareableURL)
-
 	return nil
 }
 
-// Helper function to sanitize file names
 func sanitizeFileName(fileName string) string {
-	// Remove query parameters and sanitize the filename
-	parsedURL := regexp.MustCompile(`[^\w\s-]`).ReplaceAllString(fileName, "_") // Replace special chars with _
-	parsedURL = regexp.MustCompile(`[\s-]+`).ReplaceAllString(parsedURL, "_")   // Replace spaces with underscores
-	parsedURL = strings.Trim(parsedURL, "_")                                    // Trim leading/trailing underscores
-	parsedURL = parsedURL + ".jpg"                                              // Ensure it has a valid extension
+	parsedURL := regexp.MustCompile(`[^\w\s-]`).ReplaceAllString(fileName, "_")
+	parsedURL = regexp.MustCompile(`[\s-]+`).ReplaceAllString(parsedURL, "_")
+	parsedURL = strings.Trim(parsedURL, "_")
+	parsedURL = parsedURL + ".jpg"
 	return parsedURL
 }
 
-// Helper function to extract the file name from the URL
 func extractFileName(url string) string {
 	tokens := strings.Split(url, "/")
 	return tokens[len(tokens)-1]
 }
 
-// Main function to start the image processing service
 func main() {
-	// Print a simple message
 	fmt.Println("Starting image processing service...")
 
-	// The service will now listen for image processing tasks from the RabbitMQ queue.
-	// init() will take care of starting the RabbitMQ connection and consuming messages.
 	select {} // This keeps the main function running indefinitely
 }
