@@ -56,17 +56,17 @@ POSTGRES_URL=<Your_PostgreSQL_Connection_URL>
 ```bash
 go mod tidy
 ```
-3. **Start RabbitMQ**
-    Ensure RabbitMQ is running at localhost:5672.
-4. **Start the PostgreSQL Database**
-    Ensure your PostgreSQL database is up and running.
-4. **Run the Application**
-    Build and run the Go services:
-    -**main.go**
+4. **Start RabbitMQ**
+    - Ensure RabbitMQ is running at localhost:5672.
+5. **Start the PostgreSQL Database**
+    - Ensure your PostgreSQL database is up and running.
+6. **Run the Application**
+    - Build and run the Go services:
+    - **main.go**
     ```bash
     go run main.go
     ```
-    -**consumer.go**
+    - **consumer.go**
     ```bash
     go run consumer.go
     ```
