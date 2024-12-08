@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox"
-	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/files"
 	"github.com/dropbox/dropbox-sdk-go-unofficial/v6/dropbox/sharing"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
@@ -130,6 +129,7 @@ func consumeImages(ch *amqp.Channel) {
 		}
 	}
 }
+
 func processImage(imageURL string, productID int) error {
 	// Fetch the image from the URL
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -155,89 +155,88 @@ func processImage(imageURL string, productID int) error {
 		return fmt.Errorf("failed to encode image: %v", err)
 	}
 
-	// Set up Dropbox client
-	dropboxClient := files.New(dropboxConfig)
-
 	// Set the path to upload to Dropbox
 	path := "/" + sanitizeFileName(extractFileName(imageURL))
 
-	// Create the UploadArg
-	uploadArg := files.NewUploadArg(path)
-	uploadArg.Mode = &files.WriteMode{Tagged: dropbox.Tagged{
-		Tag: "overwrite", // This sets the mode to overwrite
-	}}
-
-	// Upload the image to Dropbox
-	_, err = dropboxClient.Upload(uploadArg, &buffer)
-	if err != nil {
-		return fmt.Errorf("failed to upload image to Dropbox: %v", err)
-	}
-
-	// Generate the sharable link
+	// Set up Dropbox sharing client
 	sharingClient := sharing.New(dropboxConfig)
+
+	// First, try to create a shared link
+	// First, try to create a shared link
 	linkArg := &sharing.CreateSharedLinkWithSettingsArg{
 		Path: path,
 	}
 
-	// Try to create a shared link
-	linkMetadata, err := sharingClient.CreateSharedLinkWithSettings(linkArg)
-
 	var shareableURL string
+	linkMetadata, err := sharingClient.CreateSharedLinkWithSettings(linkArg)
 	if err != nil {
-		// Check if the error indicates that the shared link already exists
 		if dropboxError, ok := err.(dropbox.APIError); ok {
-			fmt.Println("Error Summary:", dropboxError.ErrorSummary) // Debugging the error
-			if dropboxError.ErrorSummary == "shared_link_already_exists/metadata/" {
-				// If the link already exists, retrieve the existing metadata
-				fmt.Println("Shared link already exists, retrieving metadata...")
-				// Call GetSharedLinkMetadata to retrieve the existing shared link
-				existingLink, err := sharingClient.GetSharedLinkMetadata(&sharing.GetSharedLinkMetadataArg{
-					Url: "https://www.dropbox.com" + path, // Full URL with the Dropbox domain
+			// Check if the error message contains "shared_link_already_exists/metadata/"
+			if strings.Contains(dropboxError.Error(), "shared_link_already_exists/metadata/") {
+				log.Println("Shared link already exists for path:", path)
+
+				// Fetch the existing shared link
+				existingLinks, err := sharingClient.ListSharedLinks(&sharing.ListSharedLinksArg{
+					Path: path,
 				})
-				if err != nil {
+				if err != nil || len(existingLinks.Links) == 0 {
 					return fmt.Errorf("failed to retrieve existing shared link: %v", err)
 				}
 
-				// Assert the existing link to the correct type (FileLinkMetadata)
-				if fileLinkMetadata, ok := existingLink.(*sharing.FileLinkMetadata); ok {
+				// Extract the URL from the first link metadata
+				if fileLinkMetadata, ok := existingLinks.Links[0].(*sharing.FileLinkMetadata); ok {
 					shareableURL = fileLinkMetadata.Url
-					fmt.Println("Shared link already exists:", shareableURL)
+					log.Println("Existing shared link for path", path, ": ", shareableURL) // Print path and URL
 				} else {
 					return fmt.Errorf("unexpected metadata type for shared link")
 				}
 			} else {
-				// If the error is not related to the link already existing, return the error
-				return fmt.Errorf("failed to create sharable link: %v", err)
+				// Handle other types of errors that might occur
+				return fmt.Errorf("failed to create shared link: %v", err)
 			}
 		} else {
-			// If the error is not an APIError, return the error
-			return fmt.Errorf("failed to create sharable link: %v", err)
+			// If it's not an APIError, log the error and proceed
+			log.Println("Error from Dropbox:", err)
+			var a string
+			a = err.Error()
+			if strings.Contains(a, "shared_link_already_exists/metadata/") {
+				existingLinks, err := sharingClient.ListSharedLinks(&sharing.ListSharedLinksArg{
+					Path: path,
+				})
+				if err != nil || len(existingLinks.Links) == 0 {
+					return fmt.Errorf("failed to retrieve existing shared link: %v", err)
+				}
+
+				// Extract the URL from the first link metadata
+				if fileLinkMetadata, ok := existingLinks.Links[0].(*sharing.FileLinkMetadata); ok {
+					shareableURL = fileLinkMetadata.Url
+					log.Println("Existing shared link for path", path, ": ", shareableURL) // Print path and URL
+				} else {
+					return fmt.Errorf("unexpected metadata type for shared link")
+				}
+			}
+			log.Println("failed to create shared link: %v", err)
 		}
+
 	} else {
-		// Extract the sharable URL from the metadata
+		// If we successfully created the link, extract the URL
 		if link, ok := linkMetadata.(*sharing.FileLinkMetadata); ok {
 			shareableURL = link.Url
-			fmt.Println("Sharable link:", shareableURL)
 		} else {
 			return fmt.Errorf("unexpected metadata type")
 		}
 	}
 
 	// Update the product in the database with the new compressed image URL
-	if dbPool == nil {
-		return fmt.Errorf("database connection is not initialized")
-	}
-
-	// Proceed with the database query
-	query := `
-		UPDATE products 
-		SET compressed_product_images = array_append(coalesce(compressed_product_images, '{}'::text[]), $1)
-		WHERE id = $2;
-	`
+	query := `UPDATE products 
+        SET compressed_product_images = array_append(coalesce(compressed_product_images, '{}'::text[]), $1)
+        WHERE id = $2;`
 	_, err = dbPool.Exec(context.Background(), query, shareableURL, productID)
 	if err != nil {
 		return fmt.Errorf("failed to update compressed image URL in database: %v", err)
 	}
+
+	fmt.Printf("Sharable link created/retrieved: %s\n", shareableURL)
 
 	return nil
 }
